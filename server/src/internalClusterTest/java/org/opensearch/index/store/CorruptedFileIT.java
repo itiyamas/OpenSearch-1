@@ -81,6 +81,7 @@ import org.opensearch.indices.recovery.RecoveryFileChunkRequest;
 import org.opensearch.monitor.fs.FsInfo;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.snapshots.SnapshotState;
+import org.opensearch.test.BackgroundIndexer;
 import org.opensearch.test.CorruptionUtils;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.opensearch.test.InternalSettingsPlugin;
@@ -148,8 +149,85 @@ public class CorruptedFileIT extends OpenSearchIntegTestCase {
     }
 
     /**
-     * Tests that we can actually recover from a corruption on the primary given that we have replica shards around.
+     * Tests that we cannot recover from a corruption on the primary that is actively indexing, even if it has replica.
      */
+    public void testCorruptFileDuringIndexing() throws Exception {
+        int numDocs = scaledRandomIntBetween(1, 1);
+        // have enough space for 3 copies
+        internalCluster().ensureAtLeastNumDataNodes(3);
+        if (cluster().numDataNodes() == 3) {
+            logger.info("--> cluster has [3] data nodes, corrupted primary will be overwritten");
+        }
+
+        assertThat(cluster().numDataNodes(), greaterThanOrEqualTo(3));
+
+        assertAcked(prepareCreate("test").setSettings(Settings.builder()
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, "1")
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, "1")
+            .put(MergePolicyConfig.INDEX_MERGE_ENABLED, false)
+            // no checkindex - we corrupt shards on purpose
+            .put(MockFSIndexStore.INDEX_CHECK_INDEX_ON_CLOSE_SETTING.getKey(), false)
+            // no translog based flush - it might change the .liv / segments.N files
+            .put(IndexSettings.INDEX_TRANSLOG_FLUSH_THRESHOLD_SIZE_SETTING.getKey(), new ByteSizeValue(1, ByteSizeUnit.PB))
+        ));
+        ensureGreen();
+        disableAllocation("test");
+        IndexRequestBuilder[] builders = new IndexRequestBuilder[numDocs];
+        for (int i = 0; i < builders.length; i++) {
+            builders[i] = client().prepareIndex("test", "type").setSource("field", "value");
+        }
+        indexRandom(true, builders);
+        ensureGreen();
+        // double flush to create safe commit in case of async durability
+        assertAllSuccessful(client().admin().indices().prepareFlush().setForce(true).get());
+        assertAllSuccessful(client().admin().indices().prepareFlush().setForce(true).get());
+        // we have to flush at least once here since we don't corrupt the translog
+        SearchResponse countResponse = client().prepareSearch().setSize(0).get();
+        assertHitCount(countResponse, numDocs);
+        ShardRouting corruptedShardRouting = corruptRandomPrimaryFile();
+        logger.info("--> {} corrupted", corruptedShardRouting);
+
+
+        logger.info("-->  creating repository");
+        assertAcked(client().admin().cluster().preparePutRepository("test-repo")
+            .setType("fs").setSettings(Settings.builder()
+                .put("location", randomRepoPath().toAbsolutePath())
+                .put("compress", randomBoolean())
+                .put("chunk_size", randomIntBetween(100, 1000), ByteSizeUnit.BYTES)));
+        logger.info("--> snapshot");
+
+
+
+
+
+        enableAllocation("test");
+
+        try (BackgroundIndexer indexer = new BackgroundIndexer("test", "_doc", client(), 200)) {
+
+
+            waitForDocs(20, indexer);
+            final CreateSnapshotResponse createSnapshotResponse =
+                client().admin().cluster().prepareCreateSnapshot("test-repo", "test-snap")
+                    .setWaitForCompletion(true)
+                    .setIndices("test")
+                    .get();
+            final SnapshotState snapshotState = createSnapshotResponse.getSnapshotInfo().state();
+            logger.info("--> snapshot terminated with state " + snapshotState);
+            Thread.sleep(60000);
+        }
+
+        logger.info("--> Checking RED status");
+
+        ClusterHealthResponse health = client().admin().cluster()
+            .health(Requests.clusterHealthRequest("test")
+                .timeout("5m") // sometimes due to cluster rebalacing and random settings default timeout is just not enough.
+                .waitForNoRelocatingShards(true)).actionGet();
+        assertThat(health.getStatus(), equalTo(ClusterHealthStatus.RED));
+        logger.info("--> Confirmed RED status");
+
+
+    }
+
     public void testCorruptFileAndRecover() throws ExecutionException, InterruptedException, IOException {
         int numDocs = scaledRandomIntBetween(100, 1000);
         // have enough space for 3 copies
@@ -188,7 +266,7 @@ public class CorruptedFileIT extends OpenSearchIntegTestCase {
         ShardRouting corruptedShardRouting = corruptRandomPrimaryFile();
         logger.info("--> {} corrupted", corruptedShardRouting);
         enableAllocation("test");
-         /*
+        /*
          * we corrupted the primary shard - now lets make sure we never recover from it successfully
          */
         Settings build = Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, "2").build();
@@ -203,6 +281,8 @@ public class CorruptedFileIT extends OpenSearchIntegTestCase {
             assertThat("timed out waiting for green state", health.isTimedOut(), equalTo(false));
         }
         assertThat(health.getStatus(), equalTo(ClusterHealthStatus.GREEN));
+
+        ensureGreen("test");
         final int numIterations = scaledRandomIntBetween(5, 20);
         for (int i = 0; i < numIterations; i++) {
             SearchResponse response = client().prepareSearch().setSize(numDocs).get();
@@ -246,7 +326,7 @@ public class CorruptedFileIT extends OpenSearchIntegTestCase {
         };
 
         for (MockIndexEventListener.TestEventListener eventListener :
-                internalCluster().getDataNodeInstances(MockIndexEventListener.TestEventListener.class)) {
+            internalCluster().getDataNodeInstances(MockIndexEventListener.TestEventListener.class)) {
             eventListener.setNewDelegate(listener);
         }
         try {
@@ -255,7 +335,7 @@ public class CorruptedFileIT extends OpenSearchIntegTestCase {
             assertThat(exception, empty());
         } finally {
             for (MockIndexEventListener.TestEventListener eventListener :
-                    internalCluster().getDataNodeInstances(MockIndexEventListener.TestEventListener.class)) {
+                internalCluster().getDataNodeInstances(MockIndexEventListener.TestEventListener.class)) {
                 eventListener.setNewDelegate(null);
             }
         }
@@ -682,7 +762,7 @@ public class CorruptedFileIT extends OpenSearchIntegTestCase {
                             continue;
                         }
                         for (String commitFile : commitInfo.files()) {
-                            if (includePerCommitFiles || isPerSegmentFile(commitFile)) {
+                            if (commitFile.endsWith(".cfe")) {
                                 files.add(file.resolve(commitFile));
                             }
                         }

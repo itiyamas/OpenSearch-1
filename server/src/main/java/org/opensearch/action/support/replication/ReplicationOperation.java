@@ -273,6 +273,11 @@ public class ReplicationOperation<
         };
 
         pendingReplicationActions.addPendingAction(allocationId, replicationAction);
+        try {
+            Thread.sleep(2000);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
         replicationAction.run();
     }
 

@@ -96,7 +96,7 @@ public class BackgroundIndexer implements AutoCloseable {
      * @param numOfDocs number of document to index before pausing. Set to -1 to have no limit.
      */
     public BackgroundIndexer(String index, String type, Client client, int numOfDocs) {
-        this(index, type, client, numOfDocs, RandomizedTest.scaledRandomIntBetween(2, 5));
+        this(index, type, client, numOfDocs, RandomizedTest.scaledRandomIntBetween(5, 5));
     }
 
     /**
